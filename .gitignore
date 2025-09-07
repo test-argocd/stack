@@ -1,3 +1,2 @@
-bin/
-node_modules/
-.kube/
+/bin/
+/node_modules/

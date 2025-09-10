@@ -1,167 +1,168 @@
-import { readFileSync } from 'node:fs';
 import * as k8s from '@pulumi/kubernetes';
-import * as pulumi from '@pulumi/pulumi';
+import type * as pulumi from '@pulumi/pulumi';
+import { loadConfig } from '../../util/config';
+import type { Microservice } from './constants';
 
-export interface MicroserviceResourceParams {
-	namespace?: string;
-	name: string;
-	configFilePath: string;
-}
-
-export class MicroserviceResource extends pulumi.ComponentResource {
-	public readonly namespace: k8s.core.v1.Namespace;
+export class MicroserviceResource {
 	public readonly configMap: k8s.core.v1.ConfigMap;
 	public readonly deployment: k8s.apps.v1.Deployment;
 	public readonly service: k8s.core.v1.Service;
 	public readonly ingress: k8s.networking.v1.Ingress;
 
 	constructor(
-		private readonly name: string,
-		private readonly params: MicroserviceResourceParams,
-		private readonly opts?: pulumi.ComponentResourceOptions,
+		public readonly name: string,
+		public readonly args: MicroserviceResourceArgs,
 	) {
-		super('custom:backend.MicroserviceResource', name, params, opts);
-
-		const namespaceName = params?.namespace ?? 'backend';
-		this.namespace = new k8s.core.v1.Namespace(
-			`${pulumi.getStack()}/backend-namespace`,
-			{
-				metadata: {
-					name: namespaceName,
-				},
-			},
-			opts,
-		);
-
 		this.configMap = this.createConfigMap();
 		this.deployment = this.createDeployment();
 		this.service = this.createService();
-		this.ingress = this.createIngressRoute();
+		this.ingress = this.createIngress();
 	}
 
 	private createConfigMap(): k8s.core.v1.ConfigMap {
-		const configContent = readFileSync(this.params.configFilePath, 'utf8');
+		const config = loadConfig(`backend/${this.args.microservice}`);
+		if (!config) {
+			throw new Error(`provide config for microservice`);
+		}
 
-		return new k8s.core.v1.ConfigMap(
-			`${this.name}/${this.params.name}/config-map`,
-			{
-				metadata: {
-					name: this.params.name,
-					namespace: this.namespace.metadata.name,
-				},
-				data: {
-					'default.js': configContent,
-				},
+		return new k8s.core.v1.ConfigMap(`${this.name}/config-map`, {
+			metadata: {
+				name: this.args.microservice,
+				namespace: this.args.namespace,
 			},
-			this.opts,
-		);
+			data: {
+				'default.js': `export default ${JSON.stringify(config)}`,
+			},
+		});
 	}
 
 	private createDeployment(): k8s.apps.v1.Deployment {
-		return new k8s.apps.v1.Deployment(
-			`${this.name}/${this.params.name}/deployment`,
-			{
-				metadata: {
-					name: this.params.name,
-					namespace: this.namespace.metadata.name,
-				},
-				spec: {
-					replicas: 1,
-					selector: { matchLabels: { app: this.params.name } },
-					template: {
-						metadata: { labels: { app: this.params.name } },
-						spec: {
-							containers: [
-								{
-									imagePullPolicy: 'Always',
-									name: this.params.name,
-									image: 'andreipadureanu/sso:test',
-									ports: [{ containerPort: 8080 }],
-									volumeMounts: [
-										{
-											name: 'config-volume',
-											mountPath: '/app/config',
-											readOnly: true,
-										},
-									],
-								},
-							],
-							volumes: [
-								{
-									name: 'config-volume',
-									configMap: {
-										name: this.configMap.metadata.name,
-										items: [
-											{
-												key: 'default.js',
-												path: 'default.js',
-											},
-										],
-									},
-								},
-							],
+		return new k8s.apps.v1.Deployment(`${this.name}/deployment`, {
+			metadata: {
+				name: this.args.microservice,
+				namespace: this.args.namespace,
+			},
+			spec: {
+				replicas: 1,
+				selector: { matchLabels: { app: this.args.microservice } },
+				template: {
+					metadata: {
+						annotations: {
+							// This forces Kubernetes to see a "change" even with same tag
+							'deployment.kubernetes.io/timestamp': new Date().toISOString(),
 						},
+						labels: { app: this.args.microservice },
 					},
-				},
-			},
-			{ ...this.opts, dependsOn: [this.configMap] },
-		);
-	}
-
-	private createService(): k8s.core.v1.Service {
-		return new k8s.core.v1.Service(
-			`${this.name}/${this.params.name}/service`,
-			{
-				metadata: {
-					name: this.params.name,
-					namespace: this.namespace.metadata.name,
-				},
-				spec: {
-					selector: { app: this.params.name },
-					ports: [{ port: 80, targetPort: 8080 }],
-				},
-			},
-			{ ...this.opts, dependsOn: [this.deployment] },
-		);
-	}
-
-	private createIngressRoute(): k8s.networking.v1.Ingress {
-		return new k8s.networking.v1.Ingress(
-			`${this.name}/${this.params.name}/ingress`,
-			{
-				metadata: {
-					name: `${this.params.name}-ingress`,
-					namespace: this.namespace.metadata.name,
-					annotations: {
-						'kubernetes.io/ingress.class': 'nginx',
-						'nginx.ingress.kubernetes.io/ssl-redirect': 'false',
-					},
-				},
-				spec: {
-					rules: [
-						{
-							host: 'prometheus.local',
-							http: {
-								paths: [
+					spec: {
+						containers: [
+							{
+								imagePullPolicy: 'Always',
+								name: this.args.microservice,
+								image: 'docker.io/andreipadureanu/sso:test',
+								ports: [
+									{ name: 'http', containerPort: 8080, protocol: 'TCP' },
+									{ name: 'grpc', containerPort: 5000, protocol: 'TCP' },
+								],
+								volumeMounts: [
 									{
-										path: `/api/${this.params.name}`,
-										pathType: 'Prefix',
-										backend: {
-											service: {
-												name: this.service.metadata.name,
-												port: {
-													number: 80,
-												},
-											},
-										},
+										name: 'config-volume',
+										mountPath: `/usr/src/config/${this.args.microservice}`,
+										readOnly: true,
 									},
 								],
 							},
-						},
-					],
+						],
+						volumes: [
+							{
+								name: 'config-volume',
+								configMap: {
+									name: this.configMap.metadata.name,
+									items: [
+										{
+											key: 'default.js',
+											path: 'default.js',
+										},
+									],
+								},
+							},
+						],
+					},
 				},
 			},
-			{ ...this.opts, dependsOn: [this.service] },
-		);
+		});
 	}
+
+	private createService(): k8s.core.v1.Service {
+		return new k8s.core.v1.Service(`${this.args.microservice}/service`, {
+			metadata: {
+				name: `${this.args.microservice}`,
+				namespace: this.args.namespace,
+			},
+			spec: {
+				selector: { app: this.args.microservice },
+				ports: [
+					{
+						name: 'grpc',
+						port: 5000,
+						targetPort: 5000,
+						protocol: 'TCP',
+					},
+					{
+						name: 'http',
+						port: 80,
+						targetPort: 8080,
+						protocol: 'TCP',
+					},
+				],
+			},
+		});
+	}
+
+	private createIngress(): k8s.networking.v1.Ingress {
+		const config = loadConfig<{ apiPrefix: string }>(
+			`backend/${this.args.microservice}`,
+		);
+		if (!config) {
+			throw new Error(`provide config for ${this.args.microservice}`);
+		}
+
+		return new k8s.networking.v1.Ingress(`${this.name}/ingress`, {
+			metadata: {
+				name: `${this.args.microservice}`,
+				namespace: this.args.namespace,
+				annotations: {
+					'kubernetes.io/ingress.class': 'nginx',
+					'nginx.ingress.kubernetes.io/ssl-redirect': 'false',
+				},
+			},
+			spec: {
+				rules: [
+					{
+						host: 'prometheus.local',
+						http: {
+							paths: [
+								{
+									path: config.apiPrefix,
+									pathType: 'Prefix',
+									backend: {
+										service: {
+											name: this.service.metadata.name,
+											port: {
+												number: 80,
+											},
+										},
+									},
+								},
+							],
+						},
+					},
+				],
+			},
+		});
+	}
+}
+
+export interface MicroserviceResourceArgs {
+	microservice: Microservice;
+	namespace: pulumi.Output<string>;
 }
